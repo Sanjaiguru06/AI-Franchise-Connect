@@ -189,7 +189,7 @@ async def categories():
 @franchise_r.get("/mine")
 async def my_franchises(user=Depends(get_owner)):
     items = await db.franchises.find(
-        {"created_by": user["sub"]}, {"_id": 0}
+        {"created_by": user["sub"], "is_active": True}, {"_id": 0}
     ).to_list(100)
     return {"franchises": items}
 
