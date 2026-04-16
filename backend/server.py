@@ -56,10 +56,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Franchise Platform API", redirect_slashes=False, lifespan=lifespan)
 
 # CORS — restrict origins in production
-_origins = ["*"] if FRONTEND_URL == "*" else [FRONTEND_URL, "http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
+    allow_origins=[
+        "https://ai-franchise-connect.vercel.app",
+        "http://localhost:3000",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
