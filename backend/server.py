@@ -1,9 +1,10 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, BeforeValidator
-from typing import Annotated, List, Optional, Any
+from typing import Annotated, List, Optional
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -18,21 +19,51 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # ── Config ──────────────────────────────────────────────────────────────────
-MONGO_URL = os.environ['MONGO_URL']
-DB_NAME = os.environ['DB_NAME']
-JWT_SECRET = os.environ['JWT_SECRET']
-JWT_ALGO = os.environ.get('JWT_ALGORITHM', 'HS256')
-JWT_DAYS = int(os.environ.get('JWT_EXPIRY_DAYS', 7))
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
-
-# ── DB ───────────────────────────────────────────────────────────────────────
-mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client[DB_NAME]
-groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+MONGO_URL       = os.environ['MONGO_URL']
+DB_NAME         = os.environ['DB_NAME']
+JWT_SECRET      = os.environ['JWT_SECRET']
+JWT_ALGO        = os.environ.get('JWT_ALGORITHM', 'HS256')
+JWT_DAYS        = int(os.environ.get('JWT_EXPIRY_DAYS', 7))
+GROQ_API_KEY    = os.environ.get('GROQ_API_KEY')
+GROQ_MODEL      = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+# FRONTEND_URL used for CORS — set to your Vercel URL in Render env vars
+FRONTEND_URL    = os.environ.get('FRONTEND_URL', '*')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
+
+# ── DB & AI clients (initialised in lifespan) ────────────────────────────────
+mongo_client: AsyncIOMotorClient = None
+db = None
+groq_client = None
+
+# ── Lifespan (replaces deprecated @app.on_event) ─────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mongo_client, db, groq_client
+    # ── startup ──
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    db = mongo_client[DB_NAME]
+    groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    await seed()
+    logger.info("Server started successfully.")
+    yield
+    # ── shutdown ──
+    mongo_client.close()
+    logger.info("Server shut down.")
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Franchise Platform API", redirect_slashes=False, lifespan=lifespan)
+
+# CORS — restrict origins in production
+_origins = ["*"] if FRONTEND_URL == "*" else [FRONTEND_URL, "http://localhost:3000"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── ObjectId helper ──────────────────────────────────────────────────────────
 def to_str(v): return str(v) if isinstance(v, ObjectId) else v
@@ -52,8 +83,10 @@ def check_pw(pw: str, hashed: str) -> bool:
     return bcrypt.checkpw(pw.encode(), hashed.encode())
 
 def make_token(user_id: str, email: str, role: str) -> str:
-    payload = {"sub": user_id, "email": email, "role": role,
-               "exp": datetime.now(timezone.utc) + timedelta(days=JWT_DAYS)}
+    payload = {
+        "sub": user_id, "email": email, "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_DAYS)
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 bearer = HTTPBearer()
@@ -88,11 +121,11 @@ class LoginIn(BaseModel):
     email: str; password: str
 
 class QuizIn(BaseModel):
-    budget: str          # under_5L | 5L_15L | 15L_30L | 30L_60L | above_60L
-    zone: str            # south_omr | central | north | west | outskirts | any
-    experience: str      # none | basic | experienced
-    risk: str            # low | medium | high
-    categories: List[str]  # list of categories or ["All"]
+    budget: str
+    zone: str
+    experience: str
+    risk: str
+    categories: List[str]
 
 class ChatIn(BaseModel):
     franchise_id: str; message: str; session_id: Optional[str] = None
@@ -109,24 +142,30 @@ class FranchiseCreate(BaseModel):
     contact_email: Optional[str] = None; contact_phone: Optional[str] = None
 
 # ── Routers ──────────────────────────────────────────────────────────────────
-app = FastAPI(title="Franchise Platform API", redirect_slashes=False)
-api = APIRouter(prefix="/api", redirect_slashes=False)
-auth_r = APIRouter(prefix="/auth", tags=["Auth"])
+api       = APIRouter(prefix="/api", redirect_slashes=False)
+auth_r    = APIRouter(prefix="/auth",       tags=["Auth"])
 franchise_r = APIRouter(prefix="/franchises", tags=["Franchises"], redirect_slashes=False)
-ai_r = APIRouter(prefix="/ai", tags=["AI"])
-location_r = APIRouter(prefix="/location", tags=["Location"])
+ai_r      = APIRouter(prefix="/ai",         tags=["AI"])
+location_r = APIRouter(prefix="/location",  tags=["Location"])
 
-# ─────────────────────── AUTH ────────────────────────────────────────────────
+# ── Health check ──────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ─────────────────────── AUTH ─────────────────────────────────────────────────
 @auth_r.post("/register")
 async def register(body: RegisterIn):
     if await db.users.find_one({"email": body.email}):
         raise HTTPException(400, "Email already registered")
     if body.role not in ("seeker", "owner"):
         raise HTTPException(400, "Role must be seeker or owner")
-    doc = {"name": body.name, "email": body.email,
-           "password_hash": hash_pw(body.password), "role": body.role,
-           "created_at": datetime.now(timezone.utc).isoformat(),
-           "saved_franchises": [], "quiz_results": []}
+    doc = {
+        "name": body.name, "email": body.email,
+        "password_hash": hash_pw(body.password), "role": body.role,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "saved_franchises": [], "quiz_results": []
+    }
     res = await db.users.insert_one(doc)
     token = make_token(str(res.inserted_id), body.email, body.role)
     return {"token": token, "role": body.role, "name": body.name, "email": body.email}
@@ -166,8 +205,10 @@ async def list_franchises(
     if investment_max:
         q["investment_max"] = {"$lte": investment_max}
     if zone and zone != "any":
-        zone_map = {"south_omr": "South Chennai", "central": "Central Chennai",
-                    "north": "North Chennai", "west": "West Chennai", "outskirts": "Outskirts"}
+        zone_map = {
+            "south_omr": "South Chennai", "central": "Central Chennai",
+            "north": "North Chennai", "west": "West Chennai", "outskirts": "Outskirts"
+        }
         z = zone_map.get(zone, zone)
         q["best_chennai_zones"] = {"$in": [z, "OMR/IT Corridor"]}
     if risk:
@@ -209,12 +250,14 @@ async def create_franchise(body: FranchiseCreate, user=Depends(get_owner)):
         body.operational_complexity, body.brand_type
     )
     doc = body.model_dump()
-    doc.update({"franchise_id": str(uuid.uuid4()), "viability_score": score,
-                "risk_level": risk, "is_active": True,
-                "created_by": user["sub"], "training_provided": True,
-                "setup_includes": ["Equipment", "Branding", "Training"],
-                "franchise_fee_numeric": 0,
-                "created_at": datetime.now(timezone.utc).isoformat()})
+    doc.update({
+        "franchise_id": str(uuid.uuid4()), "viability_score": score,
+        "risk_level": risk, "is_active": True,
+        "created_by": user["sub"], "training_provided": True,
+        "setup_includes": ["Equipment", "Branding", "Training"],
+        "franchise_fee_numeric": 0,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
     await db.franchises.insert_one(doc)
     doc.pop("_id", None)
     return doc
@@ -248,9 +291,12 @@ BUDGET_LABEL = {
     "15L_30L": "₹15–30 Lakhs", "30L_60L": "₹30–60 Lakhs", "above_60L": "Above ₹60 Lakhs"
 }
 ZONE_LABEL = {
-    "south_omr": "South Chennai / OMR / IT Corridor", "central": "Central Chennai (Anna Nagar)",
-    "north": "North Chennai (Padi / Ambattur)", "west": "West Chennai (Porur / Vadapalani)",
-    "outskirts": "Outskirts (GST / ECR)", "any": "Any zone in Chennai"
+    "south_omr": "South Chennai / OMR / IT Corridor",
+    "central": "Central Chennai (Anna Nagar)",
+    "north": "North Chennai (Padi / Ambattur)",
+    "west": "West Chennai (Porur / Vadapalani)",
+    "outskirts": "Outskirts (GST / ECR)",
+    "any": "Any zone in Chennai"
 }
 
 @ai_r.post("/match")
@@ -262,7 +308,6 @@ async def ai_match(quiz: QuizIn, user=Depends(get_user)):
 
     all_matches = await db.franchises.find(q, {"_id": 0}).to_list(200)
 
-    # Build compact summaries for Groq
     summaries = []
     for f in all_matches[:40]:
         summaries.append({
@@ -280,7 +325,7 @@ async def ai_match(quiz: QuizIn, user=Depends(get_user)):
             "description": f["short_description"][:80]
         })
 
-    system = """You are an expert franchise advisor specializing in the Chennai, India market. 
+    system = """You are an expert franchise advisor specializing in the Chennai, India market.
 Analyze franchise options for a potential investor and rank the best matches.
 Always return ONLY valid JSON with no markdown, no explanation outside the JSON."""
 
@@ -305,19 +350,16 @@ Return top 12 franchise matches ranked by fit. JSON format ONLY:
         raw = await ask_groq([{"role": "user", "content": prompt}], system, 1500)
         raw = raw.strip()
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if json_match:
-            result = json.loads(json_match.group())
-        else:
-            result = json.loads(raw)
+        result = json.loads(json_match.group() if json_match else raw)
         rankings = result.get("rankings", [])
     except Exception as e:
         logger.error(f"Groq match error: {e}")
-        rankings = [{"franchise_id": f.get("franchise_id", f["name"]),
-                     "match_score": f["viability_score"],
-                     "reason": f"Good match for your {quiz.budget} budget in {quiz.zone}."
-                     } for f in all_matches[:12]]
+        rankings = [{
+            "franchise_id": f.get("franchise_id", f["name"]),
+            "match_score": f["viability_score"],
+            "reason": f"Good match for your {quiz.budget} budget in {quiz.zone}."
+        } for f in all_matches[:12]]
 
-    # Build enriched response
     franchise_map = {f.get("franchise_id", f["name"]): f for f in all_matches}
     enriched = []
     for r in rankings[:12]:
@@ -331,7 +373,6 @@ Return top 12 franchise matches ranked by fit. JSON format ONLY:
             enriched.append({**f, "match_score": r.get("match_score", 70),
                               "match_reason": r.get("reason", "")})
 
-    # Save quiz result
     await db.quiz_results.insert_one({
         "user_id": user["sub"], "quiz_answers": quiz.model_dump(),
         "recommendations": [e.get("franchise_id", e.get("name")) for e in enriched[:5]],
@@ -348,8 +389,6 @@ async def ai_chat(body: ChatIn, user=Depends(get_user)):
         raise HTTPException(404, "Franchise not found")
 
     session_id = body.session_id or str(uuid.uuid4())
-
-    # Get chat history
     session = await db.chat_sessions.find_one({"session_id": session_id})
     history = session.get("messages", []) if session else []
 
@@ -372,23 +411,26 @@ Franchise Context:
     msgs = history[-8:] + [{"role": "user", "content": body.message}]
     ai_response = await ask_groq(msgs, system, 400)
 
-    # Persist session
     new_msgs = history + [
         {"role": "user", "content": body.message},
         {"role": "assistant", "content": ai_response}
     ]
     await db.chat_sessions.update_one(
         {"session_id": session_id},
-        {"$set": {"session_id": session_id, "franchise_id": body.franchise_id,
-                  "user_id": user["sub"], "messages": new_msgs[-20:],
-                  "updated_at": datetime.now(timezone.utc).isoformat()}},
+        {"$set": {
+            "session_id": session_id, "franchise_id": body.franchise_id,
+            "user_id": user["sub"], "messages": new_msgs[-20:],
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }},
         upsert=True
     )
     return {"response": ai_response, "session_id": session_id}
 
 @ai_r.get("/chat/{session_id}")
 async def get_chat(session_id: str, user=Depends(get_user)):
-    session = await db.chat_sessions.find_one({"session_id": session_id, "user_id": user["sub"]}, {"_id": 0})
+    session = await db.chat_sessions.find_one(
+        {"session_id": session_id, "user_id": user["sub"]}, {"_id": 0}
+    )
     if not session:
         return {"messages": [], "session_id": session_id}
     return session
@@ -405,11 +447,10 @@ async def ai_roadmap(body: dict, user=Depends(get_user)):
     zone = body.get("zone", "South Chennai")
     experience = body.get("experience", "none")
 
-    system = """You are a Chennai franchise launch expert. Create a detailed, actionable roadmap.
-Return ONLY valid JSON with no markdown."""
+    system = "You are a Chennai franchise launch expert. Create a detailed, actionable roadmap.\nReturn ONLY valid JSON with no markdown."
 
     prompt = f"""Create a 7-step launch roadmap for {f['name']} franchise in Chennai.
-Investor Profile: Investment ₹{f['investment_min']//100000}-{f['investment_max']//100000}L, 
+Investor Profile: Investment ₹{f['investment_min']//100000}-{f['investment_max']//100000}L,
 Zone: {zone}, Experience: {experience}
 
 Return JSON only:
@@ -432,8 +473,7 @@ Return JSON only:
     try:
         raw = await ask_groq([{"role": "user", "content": prompt}], system, 2000)
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        result = json.loads(json_match.group() if json_match else raw)
-        return result
+        return json.loads(json_match.group() if json_match else raw)
     except Exception as e:
         logger.error(f"Roadmap error: {e}")
         return {
@@ -445,16 +485,16 @@ Return JSON only:
                  "actions": ["Request Franchise Disclosure Document", "Visit 2-3 active outlets", "Talk to existing franchisees", "Consult a CA"], "cost_estimate": "₹0", "icon": "🔍"},
                 {"step": 2, "title": "Financial Planning", "duration": "Week 2-3",
                  "description": "Secure your investment capital and plan for working capital needs beyond setup costs.",
-                 "actions": ["Open dedicated business account", "Arrange ₹" + str(f['investment_min']//100000) + "-" + str(f['investment_max']//100000) + "L funding", "Plan 3-month working capital", "Consider MUDRA loan if needed"], "cost_estimate": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L", "icon": "💰"},
+                 "actions": ["Open dedicated business account", f"Arrange ₹{f['investment_min']//100000}-{f['investment_max']//100000}L funding", "Plan 3-month working capital", "Consider MUDRA loan if needed"], "cost_estimate": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L", "icon": "💰"},
                 {"step": 3, "title": "Location Scouting in Chennai", "duration": "Week 3-4",
                  "description": f"Scout for ideal location in {f.get('best_chennai_zones', ['South Chennai'])[0]}. Negotiate lease terms carefully.",
-                 "actions": ["Survey " + ", ".join(f.get('best_chennai_zones', [])[:2]), "Check footfall data", "Negotiate 3-year lease", "Confirm municipal approvals"], "cost_estimate": "₹0", "icon": "📍"},
+                 "actions": ["Survey " + ", ".join(f.get("best_chennai_zones", [])[:2]), "Check footfall data", "Negotiate 3-year lease", "Confirm municipal approvals"], "cost_estimate": "₹0", "icon": "📍"},
                 {"step": 4, "title": "Legal & Licensing", "duration": "Week 4-5",
                  "description": "Complete all regulatory requirements. This is critical — don't skip any registrations.",
                  "actions": ["Register business (Sole/LLP/Pvt Ltd)", "FSSAI license (if F&B)", "GST registration", "Sign franchise agreement with lawyer review"], "cost_estimate": "₹15,000-₹40,000", "icon": "⚖️"},
                 {"step": 5, "title": "Setup & Infrastructure", "duration": "Week 5-8",
                  "description": f"Complete physical setup as per {f['name']} standards. Franchisor team will guide interior and equipment.",
-                 "actions": ["Interior design per brand guidelines", "Equipment installation", "Staff recruitment (need: " + str(f.get('staff_required', '3-5')) + " people)", "Utilities setup"], "cost_estimate": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L", "icon": "🏗️"},
+                 "actions": ["Interior design per brand guidelines", "Equipment installation", "Staff recruitment (need: " + str(f.get("staff_required", "3-5")) + " people)", "Utilities setup"], "cost_estimate": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L", "icon": "🏗️"},
                 {"step": 6, "title": "Training & Soft Launch", "duration": "Week 8-10",
                  "description": "Complete franchisor training program. Run a soft launch with invited guests before full opening.",
                  "actions": ["Complete brand training", "Staff skills training", "Soft launch (invite 50+ people)", "Collect feedback & improve"], "cost_estimate": "₹5,000-₹20,000", "icon": "🎓"},
@@ -484,14 +524,13 @@ async def compare_insight(body: dict, user=Depends(get_user)):
         raise HTTPException(400, "Need at least 2 franchises to compare")
 
     names = [f["name"] for f in franchises]
-    summaries = []
-    for f in franchises:
-        summaries.append({
-            "name": f["name"], "investment": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L",
-            "royalty": f["royalty_level"], "viability": f["viability_score"],
-            "risk": f["risk_level"], "breakeven": f"{f['breakeven_months_min']}-{f['breakeven_months_max']}mo",
-            "beginner": f["beginner_friendly"], "category": f["category"]
-        })
+    summaries = [{
+        "name": f["name"],
+        "investment": f"₹{f['investment_min']//100000}-{f['investment_max']//100000}L",
+        "royalty": f["royalty_level"], "viability": f["viability_score"],
+        "risk": f["risk_level"], "breakeven": f"{f['breakeven_months_min']}-{f['breakeven_months_max']}mo",
+        "beginner": f["beginner_friendly"], "category": f["category"]
+    } for f in franchises]
 
     prompt = f"""Compare these franchise options: {', '.join(names)}
 
@@ -506,8 +545,10 @@ Return JSON: {{"verdict": "...", "best_for_beginners": "name", "best_roi": "name
         jm = re.search(r'\{.*\}', raw, re.DOTALL)
         return json.loads(jm.group() if jm else raw)
     except Exception:
-        return {"verdict": f"Comparing {', '.join(names)}: each offers different trade-offs in investment and risk.",
-                "best_for_beginners": names[0], "best_roi": names[0], "lowest_risk": names[0]}
+        return {
+            "verdict": f"Comparing {', '.join(names)}: each offers different trade-offs in investment and risk.",
+            "best_for_beginners": names[0], "best_roi": names[0], "lowest_risk": names[0]
+        }
 
 # ─────────────────────── LOCATION ─────────────────────────────────────────────
 CHENNAI_ZONES = [
@@ -577,16 +618,14 @@ async def compare(body: dict):
             result.append(f)
     return {"franchises": result}
 
-# ─────────────────────── APP SETUP ───────────────────────────────────────────
+# ─────────────────────── ROUTER WIRING ───────────────────────────────────────
 api.include_router(auth_r)
 api.include_router(franchise_r)
 api.include_router(ai_r)
 api.include_router(location_r)
 app.include_router(api)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
+# ─────────────────────── SEED ────────────────────────────────────────────────
 async def seed():
     count = await db.franchises.count_documents({})
     if count > 0:
@@ -603,11 +642,3 @@ async def seed():
     await db.franchises.create_index("category")
     await db.franchises.create_index("viability_score")
     logger.info(f"Seeded {len(docs)} franchises successfully.")
-
-@app.on_event("startup")
-async def startup():
-    await seed()
-
-@app.on_event("shutdown")
-async def shutdown():
-    mongo_client.close()
